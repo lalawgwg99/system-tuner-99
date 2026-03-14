@@ -34,364 +34,397 @@ OpenClaw + Claude Code 全方位診斷與優化工具。適用於任何 OpenClaw
 在執行任何診斷前，先偵測環境：
 
 ```bash
-# 偵測 OS
-OS=$(uname -s)  # Darwin = macOS, Linux = Linux
+OS=$(uname -s)
+export OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+export OPENCLAW_CONFIG="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_HOME/openclaw.json}"
+export CLAUDE_HOME="$HOME/.claude"
 
-# 偵測 OpenClaw 設定目錄
-OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
-OPENCLAW_CONFIG="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_HOME/openclaw.json}"
-
-# 偵測 Claude Code 設定目錄
-CLAUDE_HOME="$HOME/.claude"
-
-# 偵測 Gateway port（從設定讀取）
-GW_PORT=$(python3 -c "
-import json
-cfg = json.load(open('$OPENCLAW_CONFIG'))
+# Gateway port（從設定讀取，失敗 fallback 18789）
+GW_PORT=18789
+if [ -f "$OPENCLAW_CONFIG" ]; then
+    GW_PORT=$(python3 -c "
+import json, os
+with open(os.environ['OPENCLAW_CONFIG']) as f:
+    cfg = json.load(f)
 print(cfg.get('gateway',{}).get('port', 18789))
 " 2>/dev/null || echo 18789)
+fi
 
 # 偵測 service manager
 if [ "$OS" = "Darwin" ]; then
-    # macOS: 找 launchd label
     LAUNCHD_LABEL=$(launchctl print gui/$(id -u) 2>/dev/null | grep -o 'openclaw[^"]*gateway' | head -1)
     [ -z "$LAUNCHD_LABEL" ] && LAUNCHD_LABEL="ai.openclaw.gateway"
     SERVICE_MGR="launchd"
+    LAUNCHD_PLIST=$(ls ~/Library/LaunchAgents/*openclaw* 2>/dev/null | head -1)
 else
-    # Linux: 找 systemd unit
     SYSTEMD_UNIT=$(systemctl --user list-units 2>/dev/null | grep -o 'openclaw[^ ]*' | head -1)
     SERVICE_MGR="systemd"
 fi
 
-# 偵測 OpenClaw 安裝位置（npm global vs local repo）
-OPENCLAW_BIN=$(which openclaw 2>/dev/null)
-OPENCLAW_REPO=$([ -f "$HOME/openclaw/package.json" ] && echo "$HOME/openclaw" || echo "")
+OPENCLAW_BIN=$(which openclaw 2>/dev/null || echo "not found")
+OPENCLAW_REPO=$([ -f "$HOME/openclaw/package.json" ] && echo "$HOME/openclaw" || echo "not found")
 
 echo "OS: $OS"
 echo "Config: $OPENCLAW_CONFIG"
 echo "Port: $GW_PORT"
 echo "Service: $SERVICE_MGR"
-echo "Binary: ${OPENCLAW_BIN:-not found}"
-echo "Repo: ${OPENCLAW_REPO:-not found}"
+echo "Binary: $OPENCLAW_BIN"
+echo "Repo: $OPENCLAW_REPO"
 ```
 
 ---
 
-## Diagnosis Checklist
+## Full Diagnosis (One-Shot)
 
-按順序執行以下診斷，每項報告狀態（✅ 正常 / ⚠️ 建議 / ❌ 問題）：
-
-### 1. Gateway 健康檢查
+> 複製以下整個 code block 到 terminal 一次執行，會輸出完整診斷報告。
 
 ```bash
-# 檢查 gateway 是否運行
-curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 http://localhost:${GW_PORT}/health
+#!/usr/bin/env bash
+set +e  # 任何單行失敗不中斷整體
 
-# macOS: 檢查 launchd 狀態
-launchctl print gui/$(id -u)/${LAUNCHD_LABEL} 2>&1 | head -10
+# ─── 輸出函式 ───
+pass() { echo "  ✅ $1"; }
+warn() { echo "  ⚠️  $1"; }
+fail() { echo "  ❌ $1"; }
 
-# Linux: 檢查 systemd 狀態
-# systemctl --user status ${SYSTEMD_UNIT} 2>&1 | head -10
+# ─── 環境偵測（用 export 穩定傳給 Python 子程序）───
+OS=$(uname -s)
+export OPENCLAW_HOME="${OPENCLAW_STATE_DIR:-$HOME/.openclaw}"
+export OPENCLAW_CONFIG="${OPENCLAW_CONFIG_PATH:-$OPENCLAW_HOME/openclaw.json}"
+export CLAUDE_HOME="$HOME/.claude"
+export CLAUDE_SETTINGS="$CLAUDE_HOME/settings.json"
+GW_PORT=18789
+[ -f "$OPENCLAW_CONFIG" ] && GW_PORT=$(python3 -c "
+import json, os
+with open(os.environ['OPENCLAW_CONFIG']) as f: cfg = json.load(f)
+print(cfg.get('gateway',{}).get('port', 18789))
+" 2>/dev/null || echo 18789)
 
-# 檢查 log 大小
-du -sh "$OPENCLAW_HOME/logs/"*.log 2>/dev/null
-```
+echo "╔══════════════════════════════════════════════╗"
+echo "║   🔧 System Tuner — OpenClaw 健康診斷        ║"
+echo "╚══════════════════════════════════════════════╝"
+echo ""
 
-**判斷標準：**
-- HTTP 200 = ✅
-- Log > 50MB = ⚠️ 建議清理
-- Gateway 未運行 = ❌
-- 無 service manager 管理 = ⚠️ 建議設定 launchd/systemd
+# ═══════════════════════════════════════════════
+# 1. Gateway 健康檢查
+# ═══════════════════════════════════════════════
+echo "━━━ 1. Gateway 健康 ━━━"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 3 "http://localhost:${GW_PORT}/health" 2>/dev/null)
+if [ "$HTTP_CODE" = "200" ]; then
+    pass "Gateway 運行中 (HTTP $HTTP_CODE)"
+else
+    fail "Gateway 無回應 (HTTP ${HTTP_CODE:-timeout})"
+fi
 
-### 2. 模型路由檢查
-
-```bash
-cat "$OPENCLAW_CONFIG" | python3 -c "
-import json, sys
-cfg = json.load(sys.stdin)
-
-print('=== Providers ===')
-for name, p in cfg.get('models', {}).get('providers', {}).items():
-    model_count = len(p.get('models', []))
-    print(f'  {name}: {p.get(\"baseUrl\", \"?\")} ({model_count} models)')
-
-print()
-print('=== Agent Model Routing ===')
-defaults = cfg.get('agents', {}).get('defaults', {}).get('model', {})
-print(f'  {\"defaults\":12} primary: {defaults.get(\"primary\", \"unset\")}')
-for fb in defaults.get('fallbacks', []):
-    print(f'  {\"\":12} fallback: {fb}')
-print()
-
-for agent in cfg.get('agents', {}).get('list', []):
-    model = agent.get('model', {})
-    primary = model.get('primary', 'inherits defaults')
-    fallbacks = model.get('fallbacks', [])
-    has_free_router = any('openrouter/free' in fb for fb in fallbacks)
-    print(f'  {agent[\"id\"]:12} primary: {primary}')
-    for i, fb in enumerate(fallbacks):
-        print(f'  {\"\":12} fallback {i+1}: {fb}')
-    if not has_free_router and fallbacks:
-        print(f'  {\"\":12} ⚠️  沒有 openrouter/free 保底')
-    print()
-"
-```
-
-**API 延遲測試：**
-
-```bash
-cat "$OPENCLAW_CONFIG" | python3 -c "
-import json, sys
-cfg = json.load(sys.stdin)
-for name, p in cfg.get('models',{}).get('providers',{}).items():
-    url = p.get('baseUrl','')
-    if url: print(f'{name}|{url}')
-" | while IFS='|' read name url; do
-    latency=$(curl -s -o /dev/null -w "%{time_starttransfer}" --connect-timeout 5 "$url/models" 2>/dev/null)
-    if (( $(echo "$latency > 0.7" | bc -l 2>/dev/null || echo 0) )); then
-        echo "❌ $name: ${latency}s (太慢，建議降級為 fallback)"
-    elif (( $(echo "$latency > 0.3" | bc -l 2>/dev/null || echo 0) )); then
-        echo "⚠️  $name: ${latency}s (偏慢)"
+# Service manager
+if [ "$OS" = "Darwin" ]; then
+    LAUNCHD_LABEL=$(launchctl print gui/$(id -u) 2>/dev/null | grep -o 'openclaw[^"]*gateway' | head -1)
+    [ -z "$LAUNCHD_LABEL" ] && LAUNCHD_LABEL="ai.openclaw.gateway"
+    if launchctl print "gui/$(id -u)/${LAUNCHD_LABEL}" &>/dev/null; then
+        pass "launchd 管理中 ($LAUNCHD_LABEL)"
+        PLIST=$(ls ~/Library/LaunchAgents/*openclaw* 2>/dev/null | head -1)
+        if [ -n "$PLIST" ]; then
+            THROTTLE=$(plutil -extract ThrottleInterval raw "$PLIST" 2>/dev/null || echo "?")
+            [ "$THROTTLE" != "?" ] && [ "$THROTTLE" -lt 3 ] 2>/dev/null && \
+                warn "ThrottleInterval=$THROTTLE（太低，崩潰時會瘋狂重啟，建議 ≥5）"
+        fi
     else
-        echo "✅ $name: ${latency}s"
+        warn "無 launchd 管理（gateway 掛了不會自動重啟）"
+    fi
+elif [ "$OS" = "Linux" ]; then
+    if systemctl --user is-active openclaw-gateway &>/dev/null; then
+        pass "systemd 管理中"
+    else
+        warn "無 systemd 管理"
+    fi
+fi
+
+# Log 大小
+for log in "$OPENCLAW_HOME/logs/"*.log; do
+    [ -f "$log" ] || continue
+    SIZE_MB=$(du -m "$log" 2>/dev/null | cut -f1)
+    LOG_NAME=$(basename "$log")
+    if [ "$SIZE_MB" -gt 100 ] 2>/dev/null; then
+        fail "$LOG_NAME: ${SIZE_MB}MB（嚴重，建議 truncate）"
+    elif [ "$SIZE_MB" -gt 50 ] 2>/dev/null; then
+        warn "$LOG_NAME: ${SIZE_MB}MB（偏大，建議清理）"
+    else
+        pass "$LOG_NAME: ${SIZE_MB}MB"
     fi
 done
-```
+[ ! -d "$OPENCLAW_HOME/logs" ] && warn "logs 目錄不存在"
 
-**判斷標準：**
-- 每個 agent 至少有 1 個 fallback = ✅
-- fallback 鏈末端有 `openrouter/free` 保底 = ✅
-- 使用已停服/不存在的模型 = ❌
-- 所有 agent 用同一個模型 = ⚠️ 未善用分工
-- provider 延遲 < 0.3s = ✅, 0.3-0.7s = ⚠️, > 0.7s = ❌
+echo ""
 
-### 3. Skills 審計
+# ═══════════════════════════════════════════════
+# 2. 模型路由
+# ═══════════════════════════════════════════════
+echo "━━━ 2. 模型路由 ━━━"
+python3 -c "
+import json, os, sys, subprocess, time
 
-```bash
-cat "$OPENCLAW_CONFIG" | python3 -c "
-import json, sys, os
-cfg = json.load(sys.stdin)
+cfg = json.load(open(os.environ['OPENCLAW_CONFIG']))
+providers = cfg.get('models', {}).get('providers', {})
 
-print('=== Agent Skills Whitelist ===')
-for agent in cfg.get('agents', {}).get('list', []):
-    skills = agent.get('skills')
-    if skills is None:
-        print(f'  ❌ {agent[\"id\"]:12} skills: NOT SET (載入全部，嚴重影響效能)')
-    else:
-        print(f'  ✅ {agent[\"id\"]:12} skills: {len(skills)} 個')
+# 顯示 Providers
+for name, p in providers.items():
+    models = p.get('models', [])
+    print(f'  Provider {name}: {len(models)} 個模型')
+    url = p.get('baseUrl', '')
+    if url:
+        try:
+            start = time.time()
+            r = subprocess.run(['curl', '-s', '-o', '/dev/null', '-w', '%{time_starttransfer}',
+                               '--connect-timeout', '5', url + '/models'],
+                              capture_output=True, text=True, timeout=10)
+            latency = float(r.stdout.strip())
+            if latency > 0.7:
+                print(f'    ❌ 延遲 {latency:.2f}s（太慢，建議降級）')
+            elif latency > 0.3:
+                print(f'    ⚠️  延遲 {latency:.2f}s（偏慢）')
+            else:
+                print(f'    ✅ 延遲 {latency:.2f}s')
+        except Exception:
+            print(f'    ⚠️  延遲測試失敗')
 
+# Agent 路由
+defaults = cfg.get('agents', {}).get('defaults', {}).get('model', {})
+agents = cfg.get('agents', {}).get('list', [])
 print()
-# Count available skills
+print('  Agent 路由：')
+if defaults.get('primary'):
+    print('    %-12s primary: %s' % ('defaults', defaults.get('primary', '')))
+    for fb in defaults.get('fallbacks', []):
+        print('    %-12s fallback: %s' % ('', fb))
+
+for agent in agents:
+    aid = agent['id']
+    model = agent.get('model', {})
+    primary = model.get('primary', '(繼承 defaults)')
+    fbs = model.get('fallbacks', [])
+    has_free = any('free' in fb for fb in fbs)
+    print('    %-12s primary: %s' % (aid, primary))
+    for i, fb in enumerate(fbs, 1):
+        print('    %-12s fallback %d: %s' % ('', i, fb))
+    if fbs and not has_free:
+        print('    %-12s ⚠️  fallback 鏈缺少免費保底模型' % '')
+" 2>/dev/null || fail "模型路由檢查失敗（config 格式錯誤？）"
+
+echo ""
+
+# ═══════════════════════════════════════════════
+# 3. Skills 審計
+# ═══════════════════════════════════════════════
+echo "━━━ 3. Skills 審計 ━━━"
+python3 -c "
+import json, os
+cfg = json.load(open(os.environ['OPENCLAW_CONFIG']))
+agents = cfg.get('agents', {}).get('list', [])
+
 home = os.path.expanduser('~')
 repo_skills = os.path.join(home, 'openclaw', 'skills')
+repo_count = 0
 if os.path.isdir(repo_skills):
-    count = len([d for d in os.listdir(repo_skills) if os.path.isdir(os.path.join(repo_skills, d))])
-    print(f'官方 skills 總數: {count}')
+    repo_count = len([d for d in os.listdir(repo_skills) if os.path.isdir(os.path.join(repo_skills, d))])
+print(f'  官方 skills 目錄: {repo_count} 個')
 
-# Check workspace skills
-for agent in cfg.get('agents', {}).get('list', []):
+for agent in agents:
+    aid = agent['id']
+    skills = agent.get('skills')
+    if skills is None:
+        print(f'  ❌ {aid:12} skills: 未設白名單（載入全部，影響效能）')
+    else:
+        print(f'  ✅ {aid:12} skills: {len(skills)} 個白名單')
+
+    # Workspace skills
     ws = agent.get('workspace', '').replace('~', home)
     ws_skills = os.path.join(ws, 'skills')
     if os.path.isdir(ws_skills):
         count = len([d for d in os.listdir(ws_skills) if os.path.isdir(os.path.join(ws_skills, d))])
-        if count > 0:
-            flag = '⚠️ ' if count > 10 else '  '
-            print(f'{flag}Workspace skills ({agent[\"id\"]}): {count} 個')
-"
-```
+        if count > 10:
+            print(f'    ⚠️  workspace skills: {count} 個（過多）')
+        elif count > 0:
+            print(f'    ℹ️  workspace skills: {count} 個')
+" 2>/dev/null
 
-### 4. Claude Code MCP 檢查
+echo ""
 
-```bash
-CLAUDE_SETTINGS="$CLAUDE_HOME/settings.json"
+# ═══════════════════════════════════════════════
+# 4. Claude Code MCP
+# ═══════════════════════════════════════════════
+echo "━━━ 4. Claude Code MCP ━━━"
 if [ -f "$CLAUDE_SETTINGS" ]; then
     python3 -c "
-import json, shutil
-cfg = json.load(open('$CLAUDE_SETTINGS'))
+import json, os, shutil
+with open(os.environ['CLAUDE_SETTINGS']) as f: cfg = json.load(f)
 servers = cfg.get('mcpServers', {})
-print(f'MCP Servers: {len(servers)} 個')
+print(f'  MCP Servers: {len(servers)} 個')
 for name, srv in servers.items():
     cmd = srv.get('command', '?')
     issues = []
     if cmd == 'npx':
-        issues.append('npx 啟動慢，建議全域安裝')
-    if cmd != 'npx' and not shutil.which(cmd):
+        issues.append('npx 啟動慢 → 建議全域安裝')
+    elif cmd != '?' and not shutil.which(cmd):
         issues.append(f'command \"{cmd}\" 不存在')
-    status = '⚠️  ' + '; '.join(issues) if issues else '✅'
-    print(f'  {name}: {cmd} {status}')
+    status = ' ⚠️ ' + '; '.join(issues) if issues else ' ✅'
+    print(f'  • {name}: {cmd}{status}')
 if len(servers) > 3:
-    print(f'⚠️  MCP server 超過 3 個，影響模型/agent 切換速度')
+    print('  ⚠️  MCP server 超過 3 個，影響速度')
 " 2>/dev/null
 else
-    echo "ℹ️  未找到 Claude Code 設定（$CLAUDE_SETTINGS）"
+    echo "  ℹ️  未安裝 Claude Code"
 fi
-```
 
-### 5. Plugin 檢查
+echo ""
 
-```bash
+# ═══════════════════════════════════════════════
+# 5. Plugin 檢查
+# ═══════════════════════════════════════════════
+echo "━━━ 5. Plugin 檢查 ━━━"
 # Claude Code 插件
 PLUGIN_DIR="$CLAUDE_HOME/plugins/marketplaces/claude-plugins-official"
 if [ -d "$PLUGIN_DIR" ]; then
-    ext=$(ls "$PLUGIN_DIR/external_plugins/" 2>/dev/null | wc -l | tr -d ' ')
-    built=$(ls "$PLUGIN_DIR/plugins/" 2>/dev/null | wc -l | tr -d ' ')
-    total=$((ext + built))
-    echo "Claude Code 插件: ${ext} external + ${built} built-in = ${total} 總計"
-    [ "$total" -gt 30 ] && echo "⚠️  插件過多（${total} > 30），影響啟動速度"
+    EXT=$(ls "$PLUGIN_DIR/external_plugins/" 2>/dev/null | wc -l | tr -d ' ')
+    BUILT=$(ls "$PLUGIN_DIR/plugins/" 2>/dev/null | wc -l | tr -d ' ')
+    TOTAL=$((EXT + BUILT))
+    if [ "$TOTAL" -gt 30 ]; then
+        warn "Claude Code 插件過多 ($TOTAL > 30)，影響啟動"
+    else
+        pass "Claude Code 插件: $TOTAL 個"
+    fi
 fi
 
 # OpenClaw 插件
 python3 -c "
-import json
-cfg = json.load(open('$OPENCLAW_CONFIG'))
-plugins = cfg.get('plugins', {})
-load_paths = plugins.get('load', {}).get('paths', [])
-entries = plugins.get('entries', {})
+import json, os
+cfg = json.load(open(os.environ['OPENCLAW_CONFIG']))
+entries = cfg.get('plugins', {}).get('entries', {})
+if not entries:
+    print('  ℹ️  無 OpenClaw 插件')
 for name, e in entries.items():
     enabled = e.get('enabled', True)
     if not enabled:
-        print(f'⚠️  {name}: disabled 但仍在設定中（浪費載入時間）')
+        print(f'  ⚠️  {name}: disabled 但仍在設定中（可移除節省載入）')
     else:
-        print(f'✅ {name}: enabled')
+        print(f'  ✅ {name}: enabled')
 " 2>/dev/null
-```
 
-### 6. Session 清理
+echo ""
 
-```bash
-echo "=== Agent Session 狀態 ==="
-total_size=0
-for d in "$OPENCLAW_HOME/agents/"*/; do
-    [ ! -d "$d" ] && continue
-    agent=$(basename "$d")
-    size_bytes=$(du -sk "$d/sessions/" 2>/dev/null | cut -f1 || echo 0)
-    size_human=$(du -sh "$d/sessions/" 2>/dev/null | cut -f1 || echo "0")
-    reset_count=$(ls "$d/sessions/"*.reset.* 2>/dev/null 2>&1 | grep -c reset || echo 0)
+# ═══════════════════════════════════════════════
+# 6. Session 清理
+# ═══════════════════════════════════════════════
+echo "━━━ 6. Session 狀態 ━━━"
+TOTAL_SESSION_MB=0
+if [ -d "$OPENCLAW_HOME/agents" ]; then
+    for d in "$OPENCLAW_HOME/agents/"*/; do
+        [ -d "$d" ] || continue
+        AGENT=$(basename "$d")
+        SIZE_MB=$(du -sm "$d/sessions/" 2>/dev/null | cut -f1 || echo 0)
+        RESET_COUNT=$(find "$d/sessions/" -name "*.reset.*" 2>/dev/null | wc -l | tr -d ' ')
+        ISSUES=""
+        [ "$RESET_COUNT" -gt 0 ] && ISSUES="${RESET_COUNT} 個 reset 檔可清除"
+        [ "$SIZE_MB" -gt 50 ] 2>/dev/null && ISSUES="${ISSUES:+$ISSUES; }${SIZE_MB}MB 過大"
+        [ -n "$ISSUES" ] && warn "$AGENT: $ISSUES" || pass "$AGENT: ${SIZE_MB}MB"
+        TOTAL_SESSION_MB=$((TOTAL_SESSION_MB + SIZE_MB))
+    done
+    echo "  總計: ${TOTAL_SESSION_MB}MB"
+else
+    echo "  ℹ️  無 agent 目錄"
+fi
 
-    issues=""
-    [ "$reset_count" -gt 0 ] && issues="⚠️ ${reset_count} 個 reset 檔案可清除"
-    [ "$size_bytes" -gt 10240 ] && issues="${issues:+$issues; }⚠️ 大小 ${size_human}"
-    status="${issues:-✅}"
-
-    echo "  $agent: ${size_human} ${status}"
-    total_size=$((total_size + size_bytes))
-done
-
-# 檢查未綁定的 agent 目錄
+# Orphan agent 目錄
 python3 -c "
 import json, os
-cfg = json.load(open('$OPENCLAW_CONFIG'))
+cfg = json.load(open(os.environ['OPENCLAW_CONFIG']))
 configured = set(a['id'] for a in cfg.get('agents',{}).get('list',[]))
-agents_dir = '$OPENCLAW_HOME/agents'
+agents_dir = os.environ['OPENCLAW_HOME'] + '/agents'
 if os.path.isdir(agents_dir):
     existing = set(d for d in os.listdir(agents_dir) if os.path.isdir(os.path.join(agents_dir, d)))
     orphan = existing - configured
     for o in orphan:
-        print(f'⚠️  \"{o}\" agent 目錄存在但未在設定中使用，可刪除')
+        print(f'  ⚠️  \"{o}\" 未在設定中，可刪除')
 " 2>/dev/null
-```
 
-### 7. 安全檢查
+echo ""
 
-```bash
+# ═══════════════════════════════════════════════
+# 7. 安全檢查
+# ═══════════════════════════════════════════════
+echo "━━━ 7. 安全檢查 ━━━"
 python3 -c "
-import json
-cfg = json.load(open('$OPENCLAW_CONFIG'))
+import json, os
+cfg = json.load(open(os.environ['OPENCLAW_CONFIG']))
 
-print('=== 通道安全 ===')
-for ch_name, ch in cfg.get('channels', {}).items():
-    if not ch.get('enabled', False):
-        continue
+# 通道安全
+channels = cfg.get('channels', {})
+enabled_chs = {k: v for k, v in channels.items() if v.get('enabled', False)}
+if not enabled_chs:
+    print('  ℹ️  無啟用的通道')
+for ch_name, ch in enabled_chs.items():
     allow = ch.get('allowFrom', [])
     dm = ch.get('dmPolicy', '?')
     if '*' in allow:
-        print(f'❌ {ch_name}: allowFrom=[\"*\"] 任何人都能使用')
-    elif dm == 'open':
-        print(f'⚠️  {ch_name}: dmPolicy=open 但有 allowFrom 限制')
+        msg = '  ❌ %s: allowFrom=[*] 任何人都能使用！' % ch_name
+        print(msg)
+    elif dm == 'open' and not allow:
+        msg = '  ⚠️  %s: dmPolicy=open 且無 allowFrom 限制' % ch_name
+        print(msg)
     else:
-        print(f'✅ {ch_name}: 限制 {len(allow)} 個使用者')
+        msg = '  ✅ %s: 限制 %d 個使用者' % (ch_name, len(allow))
+        print(msg)
 
-print()
-print('=== Gateway 安全 ===')
+# Gateway
 gw = cfg.get('gateway', {})
 mode = gw.get('mode', '?')
 has_token = bool(gw.get('auth', {}).get('token'))
-print(f'Mode: {mode} {\"✅\" if mode == \"local\" else \"⚠️ 非 local 模式\"}')
-print(f'Auth token: {\"✅ 已設定\" if has_token else \"❌ 未設定\"}')
-
 print()
-print('=== API Key 檢查 ===')
+tag = '✅' if mode == 'local' else '⚠️ 非 local'
+print('  Gateway mode: %s %s' % (mode, tag))
+tag2 = '✅ 已設定' if has_token else '❌ 未設定'
+print('  Auth token: %s' % tag2)
+
+# API Key 明文
+print()
 providers = cfg.get('models', {}).get('providers', {})
 for name, p in providers.items():
     key = p.get('apiKey', '')
     if key:
         masked = key[:8] + '...' + key[-4:]
-        print(f'⚠️  {name}: API key 明文存放在設定檔 ({masked})')
-        print(f'   建議改用環境變數，如 OPENCLAW_{name.upper()}_API_KEY')
+        print('  ⚠️  %s: API key 明文存放 (%s)' % (name, masked))
+        env_name = 'OPENCLAW_%s_API_KEY' % name.upper()
+        print('     → 建議改用環境變數 %s' % env_name)
 " 2>/dev/null
 
-# Claude Code 權限白名單
-if [ -f "$CLAUDE_HOME/settings.local.json" ]; then
-    token_count=$(grep -cE 'TOKEN|SECRET|PASS|npm_[A-Za-z0-9]' "$CLAUDE_HOME/settings.local.json" 2>/dev/null || echo 0)
-    if [ "$token_count" -gt 0 ]; then
-        echo "⚠️  Claude Code 權限白名單含 ${token_count} 個疑似明文 token"
-    else
-        echo "✅ Claude Code 權限白名單無明文 token"
-    fi
-fi
-```
+echo ""
 
-### 8. Cron 與自動化
-
-```bash
-echo "=== Crontab ==="
-crontab_content=$(crontab -l 2>/dev/null)
-if [ -z "$crontab_content" ]; then
-    echo "ℹ️  無 crontab"
+# ═══════════════════════════════════════════════
+# 8. Cron 與自動化
+# ═══════════════════════════════════════════════
+echo "━━━ 8. Cron 與自動化 ━━━"
+CRONTAB=$(crontab -l 2>/dev/null)
+if [ -z "$CRONTAB" ]; then
+    echo "  ℹ️  無 crontab"
 else
-    echo "$crontab_content" | while read -r line; do
-        # 跳過註解
-        [[ "$line" =~ ^# ]] && echo "  $line" && continue
-        # 提取腳本路徑
-        script=$(echo "$line" | grep -oE '/[^ ]+\.(sh|js|py)' | head -1)
-        if [ -n "$script" ] && [ ! -f "$script" ]; then
-            echo "  ❌ $line"
-            echo "     ↳ 腳本不存在: $script"
-        else
-            echo "  ✅ $line"
+    echo "$CRONTAB" | while read -r line; do
+        [[ "$line" =~ ^# ]] && continue
+        [ -z "$line" ] && continue
+        SCRIPT=$(echo "$line" | grep -oE '/[^ ]+\.(sh|js|py)' | head -1)
+        if [ -n "$SCRIPT" ] && [ ! -f "$SCRIPT" ]; then
+            echo "  ❌ 腳本不存在: $SCRIPT"
         fi
     done
-fi
-
-# 檢查是否有 log rotation
-if crontab -l 2>/dev/null | grep -q "truncate\|logrotate\|openclaw.*log"; then
-    echo "✅ 有 log rotation"
-else
-    echo "⚠️  無 log rotation，log 會無限增長"
+    if echo "$CRONTAB" | grep -qE "truncate|logrotate|openclaw.*log"; then
+        pass "已有 log rotation"
+    else
+        warn "無 log rotation（log 會無限增長）"
+    fi
 fi
 
 echo ""
-echo "=== Service Manager ==="
-if [ "$(uname -s)" = "Darwin" ]; then
-    plist=$(ls ~/Library/LaunchAgents/*openclaw* 2>/dev/null | head -1)
-    if [ -n "$plist" ]; then
-        echo "✅ launchd: $plist"
-        # 檢查 ThrottleInterval
-        throttle=$(plutil -extract ThrottleInterval raw "$plist" 2>/dev/null || echo "?")
-        [ "$throttle" -lt 3 ] 2>/dev/null && echo "⚠️  ThrottleInterval=$throttle (太低，崩潰時會瘋狂重啟)"
-        # 檢查 KeepAlive
-        keepalive=$(plutil -extract KeepAlive raw "$plist" 2>/dev/null || echo "?")
-        echo "  KeepAlive: $keepalive"
-    else
-        echo "⚠️  無 launchd 設定，gateway 掛了不會自動重啟"
-    fi
-else
-    if systemctl --user is-enabled openclaw-gateway 2>/dev/null; then
-        echo "✅ systemd: openclaw-gateway enabled"
-    else
-        echo "⚠️  無 systemd 設定"
-    fi
-fi
+echo "╔══════════════════════════════════════════════╗"
+echo "║   📊 診斷完成 — 請依上方標記逐一處理         ║"
+echo "╚══════════════════════════════════════════════╝"
 ```
 
 ---
@@ -401,35 +434,32 @@ fi
 診斷完成後，根據發現的問題提供修復方案。**所有修改必須先告知使用者並獲得確認**。
 
 ### 效能優化
-- MCP `npx` → 全域安裝直接執行（`npm install -g <package>`）
+- MCP `npx` → 全域安裝（`npm install -g <package>`）
 - 未使用的 MCP server / plugin → 從設定移除
 - Skills 未設白名單 → 按 agent 角色設定 `"skills": [...]`
-- 高延遲 provider → 降級為 fallback，推薦低延遲替代
-- Session reset 檔案 → `rm ~/.openclaw/agents/*/sessions/*.reset.*`
+- 高延遲 provider → 降級為 fallback
+- Session reset 檔案 → `find ~/.openclaw/agents/*/sessions/ -name '*.reset.*' -delete`
 - 肥大 log → `truncate -s 0 ~/.openclaw/logs/*.log`
-- disabled plugin 仍在 load paths → 從設定完全移除
+- disabled plugin → 從設定 `entries` 完全移除
 
 ### 模型優化
-- 查詢 OpenRouter 免費模型：`curl -s https://openrouter.ai/api/v1/models | python3 -c "..."`
-- 確保每條 fallback 鏈末端有 `openrouter/free` 保底（自動選免費模型）
-- 付費模型走最便宜的 provider（比較 prompt/completion pricing）
+- 確保每條 fallback 鏈末端有免費模型保底
+- 付費模型走最便宜的 provider
 - 按 agent 角色匹配模型能力：
-  - 接待/分派 → 低延遲 + tool use（GPT-5 Nano 等）
-  - 架構/推理 → reasoning 模型（GPT-OSS 120B, Step 3.5 Flash 等）
-  - 工程/程式 → coding 專用（Qwen3 Coder 等）
+  - 接待/分派 → 低延遲 + tool use
+  - 架構/推理 → reasoning 模型
+  - 工程/程式 → coding 專用模型
   - 商業/文筆 → 通用高品質模型
 
 ### 安全加固
 - 通道 `allowFrom: ["*"]` → 限定使用者 ID
-- Gateway `--bind lan` → `mode: "local"`（localhost only）
-- 明文 API key → 建議改用環境變數
-- 權限白名單中的敏感資訊 → 移除
+- Gateway 改 `mode: "local"`（localhost only）
+- 明文 API key → 改用環境變數
 
 ### 自動化
 - 指向不存在腳本的 cron → 清除
-- 無 log rotation → 加入 cron：`0 3 * * * find ~/.openclaw/logs -name "*.log" -size +10M -exec truncate -s 0 {} \;`
+- 無 log rotation → 加入 `0 3 * * * find ~/.openclaw/logs -name '*.log' -size +10M -exec truncate -s 0 {} \;`
 - 無 service manager → 建議設定 launchd (macOS) 或 systemd (Linux)
-- launchd ThrottleInterval < 3 → 調高至 5
 
 ---
 
@@ -450,14 +480,13 @@ fi
 ## Reference: OpenRouter Free Models Query
 
 ```bash
-# 列出所有免費且支援 tool use 的模型，按 context length 排序
 curl -s https://openrouter.ai/api/v1/models | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
 free = []
 for m in data.get('data', []):
     p = m.get('pricing', {})
-    if float(p.get('prompt','1') or '1') == 0 and float(p.get('completion','1') or '1') == 0:
+    if float(p.get('prompt', '1') or '1') == 0 and float(p.get('completion', '1') or '1') == 0:
         params = m.get('supported_parameters', [])
         if 'tools' in params:
             free.append({
